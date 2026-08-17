@@ -102,6 +102,25 @@ def test_analysis_bad_axis_422s(client, path, synthetic_session):
     assert r.status_code == 422
 
 
+def test_analysis_summary_end_to_end(client, synthetic_session):
+    r = client.get("/api/analysis/summary", params={"session_id": synthetic_session})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["overall_grade"] in ("GOOD", "FAIR", "POOR", "UNKNOWN")
+    assert set(body["axes"].keys()) == {"roll", "pitch", "yaw"}
+    assert "dterm_grade" in body["noise"]
+
+
+def test_analysis_summary_unknown_session_404s(client):
+    r = client.get("/api/analysis/summary", params={"session_id": "nope"})
+    assert r.status_code == 404
+
+
+def test_job_status_unknown_404s(client):
+    r = client.get("/api/jobs/does-not-exist")
+    assert r.status_code == 404
+
+
 def test_step_response_endpoint_end_to_end(client, synthetic_session):
     r = client.get("/api/analysis/step-response", params={"session_id": synthetic_session, "axis": "roll"})
     assert r.status_code == 200

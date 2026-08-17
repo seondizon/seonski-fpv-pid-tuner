@@ -31,11 +31,13 @@ from app import config
 from app.blackbox.decode import decode_log
 from app.blackbox.logdata import BlackboxLog, load_blackbox_csv
 from app.analysis.step_response import compute_step_response
-from app.analysis.fft_noise import compute_throttle_noise_heatmap, detect_noise_peaks
+from app.analysis.fft_noise import compute_throttle_noise_heatmap, detect_noise_peaks, compute_dterm_noise_metrics
 from app.analysis.tracking import compute_tracking_error_stats
+from app.analysis import grading
 from app.fc.serial_transport import SerialTransport, SerialTransportError
 from app.fc.cli_client import BetaflightCliClient
 from app.fc.version import parse_version_from_cli_banner
+from app.jobs import get_job
 
 router = APIRouter()
 
@@ -314,3 +316,86 @@ def get_tracking(session_id: str, axis: str):
         for pct in sorted(stats.mean_abs_error_by_stick_bin)
     ]
     return _json_safe({"axis": axis, "error_std": stats.error_std, "stick_bins": stick_bins})
+
+
+@router.get("/analysis/summary")
+def get_analysis_summary(session_id: str):
+    """Consolidated, pre-graded results for the touchscreen's paginated
+    result cards (Overview / Roll / Pitch / Noise) -- one call instead of
+    the frontend making 3+ axis-by-axis requests and computing grades
+    itself. Grading thresholds live in app/analysis/grading.py so this
+    endpoint and the tuning engine agree on what "GOOD"/"FAIR"/"POOR" mean.
+    """
+    log = _require_session(session_id)
+
+    axes_out: dict[str, dict] = {}
+    axis_grades: list[str] = []
+    for axis in ("roll", "pitch", "yaw"):
+        step = compute_step_response(log, axis)
+        tracking = compute_tracking_error_stats(log, axis)
+        overshoot_grade = grading.grade_overshoot(step.overshoot_pct)
+        tracking_grade = grading.grade_tracking_error_std(tracking.error_std)
+        axis_grade = grading.overall_grade([overshoot_grade, tracking_grade])
+        axis_grades.append(axis_grade)
+        axes_out[axis] = {
+            "grade": axis_grade,
+            "tracking_pct": grading.tracking_error_std_to_pct(tracking.error_std),
+            "overshoot_pct": step.overshoot_pct,
+            "settling_time_ms": None if step.settling_time_s is None else round(step.settling_time_s * 1000, 1),
+            "oscillation": grading.grade_oscillation(step.overshoot_pct, step.settling_time_s),
+            "events_used": step.num_segments_used,
+        }
+
+    dterm_roll = compute_dterm_noise_metrics(log, "roll")
+    dterm_grade = grading.grade_dterm_noise(dterm_roll.d_p_ratio, dterm_roll.hf_energy_ratio)
+
+    win = hann(log.gyro["roll"].size, sym=False) if log.gyro["roll"].size >= 8 else None
+    main_peak = None
+    motor_harmonic_likely = False
+    if win is not None:
+        spectrum = np.abs(np.fft.rfft(log.gyro["roll"] * win))
+        freq_hz = np.fft.rfftfreq(log.gyro["roll"].size, d=1.0 / log.sample_rate_hz)
+        peaks = detect_noise_peaks(freq_hz, spectrum)
+        if peaks:
+            top = max(peaks, key=lambda p: p.magnitude_db)
+            main_peak = {"freq_hz": top.freq_hz, "classification": top.classification}
+            motor_harmonic_likely = top.classification in ("motor", "prop_blade_pass")
+
+    gyro_grade = "GOOD" if dterm_roll.hf_energy_ratio is not None and dterm_roll.hf_energy_ratio < 0.3 else "FAIR"
+    noise_out = {
+        "gyro_grade": gyro_grade,
+        "dterm_grade": dterm_grade,
+        "main_peak_hz": main_peak["freq_hz"] if main_peak else None,
+        "main_peak_classification": main_peak["classification"] if main_peak else None,
+        "motor_harmonic_likely": motor_harmonic_likely,
+    }
+
+    overall = grading.overall_grade(axis_grades + [dterm_grade, gyro_grade])
+    # Confidence is a simple, honest placeholder here (data volume only) --
+    # the real per-recommendation confidence scoring lives in the tuning
+    # engine (app/tuning/), which has more context (data-quality score per
+    # docs/research/tuning-algorithms.md) to do this properly.
+    total_events = sum(axes_out[a]["events_used"] for a in ("roll", "pitch"))
+    confidence_pct = min(95, 40 + total_events * 2)
+
+    return _json_safe(
+        {
+            "overall_grade": overall,
+            "confidence_pct": confidence_pct,
+            "axes": axes_out,
+            "noise": noise_out,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
+# Background jobs (shared polling endpoint for long-running work)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/jobs/{job_id}")
+def get_job_status(job_id: str):
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}")
+    return _json_safe(job.to_dict())
