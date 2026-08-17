@@ -22,11 +22,21 @@ Checksum = XOR of the size byte, the command byte, and every payload byte.
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
+from typing import Optional
 
 MSP_API_VERSION = 1
 MSP_FC_VARIANT = 2
 MSP_FC_VERSION = 3
+
+# Betaflight src/main/msp/msp_protocol.h: MSP_DATAFLASH_SUMMARY = 70,
+# MSP_DATAFLASH_READ = 71. Used to pull a Blackbox log directly off the FC's
+# onboard SPI dataflash over MSP, rather than requiring the user to extract
+# the file some other way. Like the version-detection commands above, these
+# are long-stable, low-numbered MSP v1 IDs.
+MSP_DATAFLASH_SUMMARY = 70
+MSP_DATAFLASH_READ = 71
 
 _HEADER = b"$M"
 _DIRECTION_TO_FC = b"<"
@@ -141,3 +151,69 @@ def parse_fc_version_payload(payload: bytes) -> FcVersion:
     if len(payload) < 3:
         raise ValueError(f"MSP_FC_VERSION payload too short: expected 3 bytes, got {len(payload)}")
     return FcVersion(major=payload[0], minor=payload[1], patch=payload[2])
+
+
+@dataclass
+class DataflashSummary:
+    ready: bool
+    total_size_bytes: int
+    used_size_bytes: int
+
+
+def parse_dataflash_summary_payload(payload: bytes) -> DataflashSummary:
+    """Per Betaflight's MSP_DATAFLASH_SUMMARY (src/main/msp/msp.c):
+        flags: 1 byte (bit 0 = ready)
+        totalSize: uint32 LE
+        usedSize: uint32 LE
+    Some firmware versions append more fields after this (e.g. sector/page
+    info) -- only the first 9 bytes are parsed; anything beyond that is
+    ignored rather than requiring an exact length match, since only
+    ready/total/used are needed here.
+    """
+    if len(payload) < 9:
+        raise ValueError(f"MSP_DATAFLASH_SUMMARY payload too short: expected >= 9 bytes, got {len(payload)}")
+    flags = payload[0]
+    total_size, used_size = struct.unpack_from("<II", payload, 1)
+    return DataflashSummary(ready=bool(flags & 0x01), total_size_bytes=total_size, used_size_bytes=used_size)
+
+
+def build_dataflash_read_request(address: int, read_length: Optional[int] = None) -> bytes:
+    """Per Betaflight's MSP_DATAFLASH_READ: request payload is
+        address: uint32 LE
+    Newer firmware also accepts an optional
+        readLength: uint16 LE
+        useLegacyFormat: uint8 (0)
+    appended, to request a specific chunk size. For maximum compatibility
+    across Betaflight versions (see docs/research/reference-analysis.md
+    section 2 on CLI/MSP not being stable across versions), this builds the
+    minimal 4-byte-address-only request by default (read_length=None), which
+    every version that implements MSP_DATAFLASH_READ at all is expected to
+    accept -- the FC decides how much to send back per call in that case.
+    The extra fields are only appended when read_length is explicitly given.
+    """
+    if address < 0 or address > 0xFFFFFFFF:
+        raise ValueError(f"address must fit in a uint32: {address!r}")
+    payload = struct.pack("<I", address)
+    if read_length is not None:
+        if not 0 <= read_length <= 0xFFFF:
+            raise ValueError(f"read_length must fit in a uint16: {read_length!r}")
+        payload += struct.pack("<HB", read_length, 0)  # useLegacyFormat=0
+    return payload
+
+
+@dataclass
+class DataflashReadResult:
+    address: int
+    data: bytes
+
+
+def parse_dataflash_read_payload(payload: bytes) -> DataflashReadResult:
+    """Response payload: address (uint32 LE) followed by the raw flash bytes
+    read starting at that address. The number of bytes returned varies by
+    firmware/MSP version and by how much data was actually available at that
+    address -- callers must use len(result.data), never assume a fixed chunk
+    size."""
+    if len(payload) < 4:
+        raise ValueError(f"MSP_DATAFLASH_READ payload too short: expected >= 4 bytes, got {len(payload)}")
+    (address,) = struct.unpack_from("<I", payload, 0)
+    return DataflashReadResult(address=address, data=payload[4:])

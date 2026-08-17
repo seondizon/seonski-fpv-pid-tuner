@@ -12,12 +12,19 @@ from app.fc.msp import (
     MSP_API_VERSION,
     MSP_FC_VARIANT,
     MSP_FC_VERSION,
+    MSP_DATAFLASH_SUMMARY,
+    MSP_DATAFLASH_READ,
     MspApiVersion,
+    DataflashSummary,
+    DataflashReadResult,
     build_msp_v1_request,
     parse_fc_variant_payload,
     parse_fc_version_payload,
     parse_msp_api_version_payload,
     parse_msp_v1_response,
+    build_dataflash_read_request,
+    parse_dataflash_summary_payload,
+    parse_dataflash_read_payload,
 )
 from app.fc.version import (
     BetaflightVersion,
@@ -391,3 +398,74 @@ def test_serial_transport_read_survives_timeout_restore_failure(monkeypatch):
 
     result = transport.read(4096, timeout=0.2)  # must not raise despite the restore failing
     assert result == b"ok"
+
+
+# ---------------------------------------------------------------------------
+# msp.py -- Blackbox dataflash commands
+# ---------------------------------------------------------------------------
+
+
+def test_dataflash_summary_payload_parses_ready_with_sizes():
+    import struct
+
+    payload = bytes([0x01]) + struct.pack("<II", 2 * 1024 * 1024, 123456)
+    summary = parse_dataflash_summary_payload(payload)
+    assert summary == DataflashSummary(ready=True, total_size_bytes=2 * 1024 * 1024, used_size_bytes=123456)
+
+
+def test_dataflash_summary_payload_not_ready():
+    import struct
+
+    payload = bytes([0x00]) + struct.pack("<II", 2 * 1024 * 1024, 0)
+    summary = parse_dataflash_summary_payload(payload)
+    assert summary.ready is False
+    assert summary.used_size_bytes == 0
+
+
+def test_dataflash_summary_payload_tolerates_extra_trailing_bytes():
+    import struct
+
+    payload = bytes([0x01]) + struct.pack("<II", 100, 50) + b"\x01\x02\x03"
+    summary = parse_dataflash_summary_payload(payload)
+    assert summary.total_size_bytes == 100
+    assert summary.used_size_bytes == 50
+
+
+def test_dataflash_summary_payload_too_short_raises():
+    with pytest.raises(ValueError):
+        parse_dataflash_summary_payload(b"\x01\x02")
+
+
+def test_build_dataflash_read_request_address_only():
+    import struct
+
+    request = build_dataflash_read_request(4096)
+    assert request == struct.pack("<I", 4096)
+
+
+def test_build_dataflash_read_request_with_length():
+    import struct
+
+    request = build_dataflash_read_request(0, read_length=512)
+    assert request == struct.pack("<I", 0) + struct.pack("<HB", 512, 0)
+
+
+def test_dataflash_read_roundtrip_via_msp_frame():
+    import struct
+
+    request = build_dataflash_read_request(1024)
+    frame = build_msp_v1_request(MSP_DATAFLASH_READ, request)
+    assert frame[4] == MSP_DATAFLASH_READ
+
+    response_payload = struct.pack("<I", 1024) + b"\xde\xad\xbe\xef"
+    response = _build_response_frame(MSP_DATAFLASH_READ, response_payload)
+    command, payload = parse_msp_v1_response(response)
+    assert command == MSP_DATAFLASH_READ
+
+    result = parse_dataflash_read_payload(payload)
+    assert result == DataflashReadResult(address=1024, data=b"\xde\xad\xbe\xef")
+
+
+def test_dataflash_read_payload_too_short_raises():
+    with pytest.raises(ValueError):
+        parse_dataflash_read_payload(b"\x01\x02")
