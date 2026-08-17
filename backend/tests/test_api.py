@@ -75,7 +75,16 @@ def synthetic_session():
 def test_fc_status_default(client):
     r = client.get("/api/fc/status")
     assert r.status_code == 200
-    assert r.json() == {"connected": False, "port": None, "firmware_version": None, "target": None}
+    assert r.json() == {
+        "connected": False,
+        "port": None,
+        "firmware_version": None,
+        "target": None,
+        "craft_name": None,
+        "pid_profile": None,
+        "blackbox_storage": None,
+        "blackbox_available": None,
+    }
 
 
 def test_index_serves_frontend(client):

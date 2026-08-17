@@ -19,3 +19,7 @@ vendor/
 *.csv
 !backend/tests/fixtures/*.csv
 logs/
+
+# Runtime-generated data (uploaded/decoded logs, persistent tune-iteration
+# history) -- deployment-specific user data, not source code.
+backend/data/

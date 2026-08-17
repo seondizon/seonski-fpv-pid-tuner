@@ -1,25 +1,19 @@
-"""API routes wiring the blackbox/analysis/fc modules together.
+"""API routes wiring the blackbox/analysis/fc/tuning modules together for
+the appliance-style touchscreen UI (see docs/ for the UX flow this backs:
+IDLE -> FC_DETECTED -> CONNECTED -> DOWNLOADING_LOG -> ANALYZING ->
+ANALYSIS_RESULTS -> TUNE_REVIEW -> TUNE_READY -> APPLYING_TUNE -> ...).
 
-Implements the contract documented in backend/static/README.md ("Assumed
-backend API contract"), which the frontend was built against. Field names
-below intentionally follow that contract closely, with real analysis-module
-field names passed through where the contract's placeholder example used a
-different label (documented inline where that happens).
-
-Deliberately NOT implemented: `GET /api/tuning/recommendations`. The
-recommendation engine itself is out of scope for this scaffold (per the
-project's safety-first design -- see docs/research/tuning-algorithms.md
-"Safety Strategies" -- recommendation logic needs its own validation pass
-before it should produce anything a user sees). The frontend already
-degrades gracefully to labeled example cards when this route 404s, so
-leaving it unimplemented is the intentionally honest behavior here rather
-than faking a 200 with an empty list.
+Field names below intentionally follow the frontend's documented contract
+closely (see backend/static/README.md for the original scaffold contract;
+this file has since grown well beyond it as the appliance rebuild added
+FC-info/blackbox-retrieval/tuning endpoints).
 """
 
 from __future__ import annotations
 
 import re
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -37,7 +31,16 @@ from app.analysis import grading
 from app.fc.serial_transport import SerialTransport, SerialTransportError
 from app.fc.cli_client import BetaflightCliClient
 from app.fc.version import parse_version_from_cli_banner
-from app.jobs import get_job
+from app.fc.detect import detect_fc_port
+from app.fc.info import get_blackbox_storage_type, get_craft_name, get_pid_profile_index
+from app.fc.blackbox_reader import BlackboxNotAvailableError, read_blackbox_from_fc
+from app.fc.msp import MSP_DATAFLASH_SUMMARY, build_msp_v1_request, parse_dataflash_summary_payload, parse_msp_v1_response
+from app.jobs import create_job, get_job, run_in_background
+from app.tuning.engine import compute_readiness, generate_recommendations
+from app.tuning.stopping import evaluate_tune_complete
+from app.tuning.store import craft_id_from_name, get_latest_iteration, load_iterations, save_iteration
+from app.tuning.compare import find_best_iteration
+from app.tuning.apply import apply_job_step_names, apply_tuning_changes
 
 router = APIRouter()
 
@@ -51,9 +54,41 @@ _VALID_AXES = ("roll", "pitch", "yaw")
 _SESSIONS: dict[str, dict] = {}  # session_id -> {"log": BlackboxLog, "duration_s": float, "log_id": str}
 
 # --- FC connection state -------------------------------------------------
-_FC_STATE: dict = {"connected": False, "port": None, "firmware_version": None, "target": None}
+_FC_STATE: dict = {
+    "connected": False,
+    "port": None,
+    "firmware_version": None,
+    "target": None,
+    "craft_name": None,
+    "pid_profile": None,
+    "blackbox_storage": None,
+    "blackbox_available": None,
+}
+
+# Live PID values read at connect time, e.g. {"p_roll": 45, "d_roll": 38, ...}.
+# Used by the tuning engine to show absolute before/after values instead of
+# relative-only changes. Cleared on disconnect, same lifetime as _FC_STATE.
+_CURRENT_PIDS: dict = {}
 
 _TARGET_PATTERN = re.compile(r"Betaflight\s*/\s*(\S+)")
+
+_PID_PARAM_NAMES = ("p_roll", "d_roll", "p_pitch", "d_pitch")
+
+
+def _reset_fc_state() -> None:
+    _FC_STATE.update(
+        {
+            "connected": False,
+            "port": None,
+            "firmware_version": None,
+            "target": None,
+            "craft_name": None,
+            "pid_profile": None,
+            "blackbox_storage": None,
+            "blackbox_available": None,
+        }
+    )
+    _CURRENT_PIDS.clear()
 
 
 def _require_axis(axis: str) -> str:
@@ -100,14 +135,44 @@ def get_fc_status():
     return dict(_FC_STATE)
 
 
+@router.get("/fc/detect")
+def detect_fc():
+    """Passive, non-connecting poll for the touchscreen UI's IDLE ->
+    FC_DETECTED transition -- see app/fc/detect.py. Intended to be polled
+    every couple of seconds by the frontend while idle; does not open the
+    port or affect _FC_STATE at all."""
+    port = detect_fc_port()
+    return {"detected": port is not None, "port": port}
+
+
 class ConnectRequest(BaseModel):
     port: Optional[str] = None
     baud: int = config.FC_SERIAL_BAUD
 
 
+def _query_dataflash_available(transport: SerialTransport) -> Optional[bool]:
+    """Best-effort MSP_DATAFLASH_SUMMARY check, run OUTSIDE CLI mode (MSP is
+    only served in normal operating mode). Returns None if it can't be
+    determined (e.g. the FC doesn't respond to this MSP command) rather than
+    guessing -- the UI should show honest "unknown" messaging in that case,
+    not a false positive/negative."""
+    try:
+        transport.write(build_msp_v1_request(MSP_DATAFLASH_SUMMARY))
+        raw = transport.read(4096, timeout=2.0)
+        _, payload = parse_msp_v1_response(raw)
+        summary = parse_dataflash_summary_payload(payload)
+        return summary.ready and summary.used_size_bytes > 0
+    except (SerialTransportError, ValueError):
+        return None
+
+
 @router.post("/fc/connect")
 def connect_fc(body: ConnectRequest = ConnectRequest()):
-    """Attempt a USB serial + CLI connection to the flight controller.
+    """Attempt a USB serial + CLI connection to the flight controller, and
+    gather everything the Connected/FC-Information screen needs in one
+    round trip: version, target, craft name, PID profile, blackbox storage
+    type/availability, and current roll/pitch PID values (used later by the
+    tuning engine to show absolute before/after values).
 
     Blocking serial I/O -- this is a sync `def` route so FastAPI runs it in
     its worker threadpool rather than blocking the event loop.
@@ -136,16 +201,31 @@ def connect_fc(body: ConnectRequest = ConnectRequest()):
             # reported target: null).
             banner = client.run_command("version")
             version = parse_version_from_cli_banner(banner)
+
+            craft_name = get_craft_name(client)
+            blackbox_storage = get_blackbox_storage_type(client)
+            pid_profile = get_pid_profile_index(client)
+
+            current_pids: dict = {}
+            for param in _PID_PARAM_NAMES:
+                response = client.run_command(f"get {param}")
+                match = re.search(rf"{re.escape(param)}\s*=\s*(-?\d+(?:\.\d+)?)", response, re.IGNORECASE)
+                if match:
+                    current_pids[param] = float(match.group(1))
         finally:
             client.exit_cli()
+
+        blackbox_available: Optional[bool] = None
+        if blackbox_storage == "SPIFLASH":
+            blackbox_available = _query_dataflash_available(transport)
     except SerialTransportError as exc:
-        _FC_STATE.update({"connected": False, "port": None, "firmware_version": None, "target": None})
+        _reset_fc_state()
         return {"success": False, "message": str(exc)}
     finally:
         transport.close()
 
     if version is None:
-        _FC_STATE.update({"connected": False, "port": None, "firmware_version": None, "target": None})
+        _reset_fc_state()
         return {"success": False, "message": f"Connected to {port} but could not parse a Betaflight version banner."}
 
     target_match = _TARGET_PATTERN.search(banner)
@@ -155,8 +235,14 @@ def connect_fc(body: ConnectRequest = ConnectRequest()):
             "port": port,
             "firmware_version": version.raw,
             "target": target_match.group(1) if target_match else None,
+            "craft_name": craft_name,
+            "pid_profile": pid_profile,
+            "blackbox_storage": blackbox_storage,
+            "blackbox_available": blackbox_available,
         }
     )
+    _CURRENT_PIDS.clear()
+    _CURRENT_PIDS.update(current_pids)
     return {"success": True, "message": f"Connected to Betaflight {version.raw} on {port}."}
 
 
@@ -184,24 +270,20 @@ def _autodetect_ports() -> list[str]:
 _DECODE_UNIT_ARGS = ["--unit-rotation", "deg/s", "--unit-acceleration", "g", "--unit-vbat", "V"]
 
 
-@router.post("/logs/upload")
-def upload_log(file: UploadFile = File(...)):
-    log_id = uuid.uuid4().hex[:12]
-    dest = config.LOG_UPLOAD_DIR / f"{log_id}_{file.filename}"
-    with open(dest, "wb") as f:
-        f.write(file.file.read())
-
+def _decode_and_register_sessions(log_path: Path, log_id: str) -> list[dict]:
+    """Shared by /logs/upload and the FC-download job: decode a raw
+    .bbl/.bfl file and register each usable embedded session. Raises
+    RuntimeError/FileNotFoundError on decode failure; returns [] (not an
+    error) if decode succeeded but no session was usable, so callers can
+    decide the right error framing for their own endpoint."""
     output_dir = config.DECODE_OUTPUT_DIR / log_id
-    try:
-        csv_paths = decode_log(str(dest), output_dir=str(output_dir), extra_args=_DECODE_UNIT_ARGS)
-    except (FileNotFoundError, RuntimeError) as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    csv_paths = decode_log(str(log_path), output_dir=str(output_dir), extra_args=_DECODE_UNIT_ARGS)
 
     sessions = []
     for i, csv_path in enumerate(csv_paths):
         try:
             log = load_blackbox_csv(csv_path)
-        except ValueError as exc:
+        except ValueError:
             # Skip a malformed/empty embedded session rather than failing the
             # whole upload -- a multi-session .BBL can contain short garbage
             # fragments (see docs/research/reference-analysis.md, blackbox-tools
@@ -213,10 +295,90 @@ def upload_log(file: UploadFile = File(...)):
         _SESSIONS[session_id] = {"log": log, "duration_s": duration_s, "log_id": log_id}
         sessions.append({"session_id": session_id, "duration_s": duration_s})
 
+    return sessions
+
+
+@router.post("/logs/upload")
+def upload_log(file: UploadFile = File(...)):
+    log_id = uuid.uuid4().hex[:12]
+    dest = config.LOG_UPLOAD_DIR / f"{log_id}_{file.filename}"
+    with open(dest, "wb") as f:
+        f.write(file.file.read())
+
+    try:
+        sessions = _decode_and_register_sessions(dest, log_id)
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     if not sessions:
         raise HTTPException(status_code=422, detail="No usable Blackbox sessions found in this log file.")
 
     return {"log_id": log_id, "sessions": sessions}
+
+
+@router.post("/logs/download-from-fc")
+def download_log_from_fc():
+    """Kick off a Job that pulls the Blackbox log directly off the
+    currently-connected FC's SPI dataflash (see app/fc/blackbox_reader.py),
+    decodes it, and registers session(s) -- the backend for the touchscreen's
+    "DOWNLOAD BLACKBOX" button. Returns immediately with a job_id; poll
+    GET /api/jobs/{job_id} for progress, per the UX spec's real-progress-
+    stages requirement (Downloading log / Decoding / Registering session).
+    """
+    if not _FC_STATE["connected"] or not _FC_STATE["port"]:
+        raise HTTPException(status_code=409, detail="No flight controller is connected.")
+    if _FC_STATE["blackbox_storage"] != "SPIFLASH":
+        storage = _FC_STATE["blackbox_storage"] or "unknown"
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This FC's Blackbox storage is {storage}, not onboard SPI flash -- "
+                "direct download isn't supported for this storage type. "
+                "Use the file-upload option instead."
+            ),
+        )
+    if _FC_STATE["blackbox_available"] is False:
+        raise HTTPException(status_code=422, detail="No Blackbox log is stored on this FC yet.")
+
+    port = _FC_STATE["port"]
+    baud = config.FC_SERIAL_BAUD
+    job = create_job(["Downloading log", "Decoding", "Registering session"])
+
+    def _work(job) -> dict:
+        job.set_step("Downloading log", "in_progress")
+        transport = SerialTransport(port, baud=baud)
+        try:
+            transport.open()
+
+            def on_progress(done: int, total: int) -> None:
+                pct = int(round(done / total * 100)) if total else 0
+                job.set_step("Downloading log", "in_progress", f"{pct}%")
+
+            try:
+                raw_bytes = read_blackbox_from_fc(transport, on_progress=on_progress)
+            except BlackboxNotAvailableError as exc:
+                raise RuntimeError(str(exc)) from exc
+        finally:
+            transport.close()
+        job.set_step("Downloading log", "done")
+
+        job.set_step("Decoding", "in_progress")
+        log_id = uuid.uuid4().hex[:12]
+        dest = config.LOG_UPLOAD_DIR / f"{log_id}_fc_download.bbl"
+        with open(dest, "wb") as f:
+            f.write(raw_bytes)
+        sessions = _decode_and_register_sessions(dest, log_id)
+        job.set_step("Decoding", "done")
+
+        job.set_step("Registering session", "in_progress")
+        if not sessions:
+            raise RuntimeError("Downloaded log decoded but contained no usable sessions.")
+        job.set_step("Registering session", "done")
+
+        return {"log_id": log_id, "sessions": sessions}
+
+    run_in_background(job, _work)
+    return {"job_id": job.id}
 
 
 # ---------------------------------------------------------------------------
@@ -399,3 +561,203 @@ def get_job_status(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id!r}")
     return _json_safe(job.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Tuning: recommendations, readiness, apply, iteration history
+# ---------------------------------------------------------------------------
+
+
+def _recommendation_inputs_for_session(log: BlackboxLog) -> tuple[dict, dict, dict]:
+    """Gather the per-axis analysis objects the tuning engine consumes,
+    for roll/pitch only (v1 scope -- see app/tuning/engine.py)."""
+    step_by_axis, dterm_by_axis, tracking_by_axis = {}, {}, {}
+    for axis in ("roll", "pitch"):
+        step_by_axis[axis] = compute_step_response(log, axis)
+        dterm_by_axis[axis] = compute_dterm_noise_metrics(log, axis)
+        tracking_by_axis[axis] = compute_tracking_error_stats(log, axis)
+    return step_by_axis, dterm_by_axis, tracking_by_axis
+
+
+def _recommendation_to_dict(rec) -> dict:
+    return {
+        "parameter": rec.parameter,
+        "axis": rec.axis,
+        "current_value": rec.current_value,
+        "proposed_value": rec.proposed_value,
+        "change_pct": rec.change_pct,
+        "reason": rec.reason,
+        "confidence_pct": rec.confidence_pct,
+        "category": rec.category,
+    }
+
+
+@router.get("/tuning/recommendations")
+def get_tuning_recommendations(session_id: str):
+    log = _require_session(session_id)
+    step_by_axis, dterm_by_axis, tracking_by_axis = _recommendation_inputs_for_session(log)
+    current_pids = dict(_CURRENT_PIDS) if _FC_STATE["connected"] else None
+    recommendations = generate_recommendations(step_by_axis, dterm_by_axis, tracking_by_axis, current_pids)
+    return _json_safe({"recommendations": [_recommendation_to_dict(r) for r in recommendations]})
+
+
+@router.get("/tuning/readiness")
+def get_tuning_readiness(session_id: str):
+    log = _require_session(session_id)
+    step_by_axis, dterm_by_axis, tracking_by_axis = _recommendation_inputs_for_session(log)
+    current_pids = dict(_CURRENT_PIDS) if _FC_STATE["connected"] else None
+    recommendations = generate_recommendations(step_by_axis, dterm_by_axis, tracking_by_axis, current_pids)
+
+    # "Version supported" and "settings read ok" are judged here (not in the
+    # engine, which has no FC-connection knowledge) using what /fc/connect
+    # already gathered -- see app/tuning/engine.py's compute_readiness
+    # docstring for why this split exists.
+    version_supported = bool(_FC_STATE["connected"] and _FC_STATE["firmware_version"])
+    settings_read_ok = bool(_FC_STATE["connected"] and _CURRENT_PIDS)
+
+    readiness = compute_readiness(recommendations, version_supported, settings_read_ok)
+    return _json_safe(
+        {
+            "version_supported": readiness.version_supported,
+            "settings_read_ok": readiness.settings_read_ok,
+            "safety_passed": readiness.safety_passed,
+            "confidence_pct": readiness.confidence_pct,
+            "blocked": readiness.blocked,
+            "block_reasons": readiness.block_reasons,
+        }
+    )
+
+
+@router.post("/tuning/apply")
+def apply_tuning(session_id: str):
+    """Write the currently-recommended changes to the connected FC --
+    SAFETY-CRITICAL, see app/tuning/apply.py. Blocked entirely if
+    /tuning/readiness would report blocked=True (re-checked here, not just
+    trusted from an earlier UI read, since state may have changed)."""
+    log = _require_session(session_id)
+    if not _FC_STATE["connected"] or not _FC_STATE["port"]:
+        raise HTTPException(status_code=409, detail="No flight controller is connected.")
+
+    step_by_axis, dterm_by_axis, tracking_by_axis = _recommendation_inputs_for_session(log)
+    current_pids = dict(_CURRENT_PIDS)
+    recommendations = generate_recommendations(step_by_axis, dterm_by_axis, tracking_by_axis, current_pids)
+    if not recommendations:
+        raise HTTPException(status_code=422, detail="No tuning changes to apply for this session.")
+
+    version_supported = bool(_FC_STATE["firmware_version"])
+    settings_read_ok = bool(_CURRENT_PIDS)
+    readiness = compute_readiness(recommendations, version_supported, settings_read_ok)
+    if readiness.blocked:
+        raise HTTPException(status_code=409, detail={"message": "Tune is not ready to apply.", "reasons": readiness.block_reasons})
+
+    port = _FC_STATE["port"]
+    baud = config.FC_SERIAL_BAUD
+    craft_id = craft_id_from_name(_FC_STATE["craft_name"])
+
+    # Snapshot the pre-apply analysis summary now (while we still have the
+    # session) so the iteration record reflects "what this tune was based
+    # on", per store.py's docstring -- the post-flight result becomes its
+    # own later iteration once the user re-analyzes after flying.
+    pre_apply_summary = get_analysis_summary(session_id)
+
+    job = create_job(apply_job_step_names())
+
+    def _reconnect() -> Optional[BetaflightCliClient]:
+        candidate = SerialTransport(port, baud=baud)
+        try:
+            candidate.open()
+        except SerialTransportError:
+            return None
+        try:
+            client = BetaflightCliClient(candidate)
+            client.enter_cli()
+            return client
+        except SerialTransportError:
+            candidate.close()
+            return None
+
+    def _work(job) -> dict:
+        transport = SerialTransport(port, baud=baud)
+        transport.open()
+        client = BetaflightCliClient(transport)
+        client.enter_cli()
+        try:
+            outcome = apply_tuning_changes(client, recommendations, job, reconnect_fn=_reconnect)
+        finally:
+            try:
+                transport.close()
+            except SerialTransportError:
+                pass
+
+        if not outcome["aborted"]:
+            save_iteration(
+                craft_id,
+                label="Applied",
+                applied_changes=[
+                    {"parameter": r.parameter, "from": r.current_value, "to": r.proposed_value}
+                    for r in recommendations
+                ],
+                analysis_summary=pre_apply_summary,
+            )
+        return outcome
+
+    run_in_background(job, _work)
+    return {"job_id": job.id}
+
+
+class RecordIterationRequest(BaseModel):
+    session_id: str
+    label: str = "Baseline"
+
+
+@router.post("/tuning/record-iteration")
+def record_iteration(body: RecordIterationRequest):
+    """Explicitly record the current session's analysis as a named
+    iteration for the connected craft -- called by the frontend at specific
+    UX moments (e.g. the first-ever analysis for a craft with no history
+    yet becomes "Baseline"), rather than any GET endpoint having the side
+    effect of silently persisting history."""
+    log = _require_session(body.session_id)  # validates the session exists
+    summary = get_analysis_summary(body.session_id)
+    craft_id = craft_id_from_name(_FC_STATE["craft_name"])
+    iteration = save_iteration(craft_id, label=body.label, applied_changes=[], analysis_summary=summary)
+    return {"craft_id": craft_id, "iteration_number": iteration.number}
+
+
+@router.get("/tuning/iterations")
+def get_tuning_iterations(craft: Optional[str] = None):
+    """Iteration history for the given craft (or the currently-connected
+    FC's craft name if not specified), plus best-tune and tune-complete
+    evaluation -- see UX spec sections 13-15."""
+    craft_name = craft if craft is not None else _FC_STATE["craft_name"]
+    craft_id = craft_id_from_name(craft_name)
+    iterations = load_iterations(craft_id)
+
+    best_number = find_best_iteration(iterations)
+    latest = iterations[-1] if iterations else None
+    previous = iterations[-2] if len(iterations) >= 2 else None
+
+    if latest is not None:
+        stopping = evaluate_tune_complete(latest.analysis_summary, previous.analysis_summary if previous else None)
+    else:
+        stopping = {"tune_complete": False, "reasons": ["No analysis recorded yet for this craft."], "improvement_pct": None}
+
+    return _json_safe(
+        {
+            "craft_id": craft_id,
+            "iterations": [
+                {
+                    "number": it.number,
+                    "timestamp": it.timestamp,
+                    "label": it.label,
+                    "applied_changes": it.applied_changes,
+                    "analysis_summary": it.analysis_summary,
+                }
+                for it in iterations
+            ],
+            "best_iteration": best_number,
+            "current_is_best": (best_number == latest.number) if latest else None,
+            "tune_complete": stopping["tune_complete"],
+            "stopping_reasons": stopping["reasons"],
+        }
+    )
