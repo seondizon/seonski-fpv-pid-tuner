@@ -6,6 +6,9 @@ test_analysis.py, and test_fc.py.
 """
 from __future__ import annotations
 
+import io
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
@@ -118,6 +121,33 @@ def test_noise_heatmap_endpoint_end_to_end(client, synthetic_session):
     assert r.status_code == 200
     body = r.json()
     assert len(body["throttle_bins_pct"]) == 100
+
+
+def test_upload_requests_explicit_units_from_blackbox_decode(client):
+    """Regression test: app/analysis/* assumes gyro/setpoint are in deg/s and
+    vbat is in volts (the step_response SP-amplitude gate, D-term noise
+    thresholds, etc. are all written against those units). blackbox_decode's
+    own default is "raw" firmware units for rotation/acceleration, which
+    silently breaks every unit-dependent threshold without ever raising an
+    error -- found by uploading a real .bbl log and seeing the step-response
+    gate pass implausible "raw-unit" values as if they were deg/s. The
+    upload route must always pass explicit --unit-* flags."""
+    fake_log = _make_synthetic_log(duration_s=1.0)
+
+    with patch("app.api.routes.decode_log") as mock_decode_log, patch(
+        "app.api.routes.load_blackbox_csv", return_value=fake_log
+    ):
+        mock_decode_log.return_value = ["/fake/path/log.01.csv"]
+        r = client.post(
+            "/api/logs/upload",
+            files={"file": ("test.bbl", io.BytesIO(b"fake bbl bytes"), "application/octet-stream")},
+        )
+
+    assert r.status_code == 200
+    assert mock_decode_log.call_count == 1
+    _, kwargs = mock_decode_log.call_args
+    assert kwargs.get("extra_args") == routes._DECODE_UNIT_ARGS
+    assert "--unit-rotation" in kwargs["extra_args"] and "deg/s" in kwargs["extra_args"]
 
 
 def test_tracking_endpoint_does_not_crash_on_nan_stick_bins(client, synthetic_session):

@@ -50,14 +50,22 @@ def _column_pattern(base: str) -> re.Pattern:
     return re.compile(r"^" + re.escape(base) + r"(\s*\(.*\))?$")
 
 
-def _find_column(fieldnames: list[str], base: str) -> Optional[str]:
+def _find_column(fieldnames: list[str], base: str, data: Optional[dict] = None) -> Optional[str]:
     """Find the actual CSV column name matching `base`, ignoring any
     trailing unit annotation blackbox_decode's --unit-* flags add
     (e.g. base="gyroADC[0]" matches both "gyroADC[0]" and
-    "gyroADC[0] (deg/s)")."""
+    "gyroADC[0] (deg/s)").
+
+    If `data` is given, a column name is only returned when it's also a key
+    in `data` -- i.e. it parsed as numeric. This matters because real
+    blackbox_decode CSVs can contain non-numeric flag columns (see the
+    load_blackbox_csv column-parsing comment); without this check, a
+    fieldnames-only match on a dropped non-numeric column would look
+    "found" to a caller but then KeyError on `data[column]`.
+    """
     pattern = _column_pattern(base)
     for name in fieldnames:
-        if pattern.match(name.strip()):
+        if pattern.match(name.strip()) and (data is None or name in data):
             return name
     return None
 
@@ -75,7 +83,7 @@ def _axis_dict(
     for i, axis in enumerate(_AXES):
         column = None
         for base in bases:
-            column = _find_column(fieldnames, f"{base}[{i}]")
+            column = _find_column(fieldnames, f"{base}[{i}]", data=data)
             if column is not None:
                 break
         result[axis] = data[column] if column is not None else np.zeros(length, dtype=float)
@@ -95,7 +103,7 @@ def _setpoint_dict(
     reconstruct setpoint themselves in that case."""
     result: dict[str, np.ndarray] = {}
     for i, axis in enumerate(_AXES):
-        column = _find_column(fieldnames, f"setpoint[{i}]")
+        column = _find_column(fieldnames, f"setpoint[{i}]", data=data)
         if column is not None:
             result[axis] = data[column]
     return result
@@ -166,7 +174,7 @@ def _compute_throttle_pct(
     We inspect the observed value range to pick the right mapping rather
     than assuming one, and always clip the result to [0, 100].
     """
-    column = _find_column(fieldnames, "rcCommand[3]")
+    column = _find_column(fieldnames, "rcCommand[3]", data=data)
     if column is None:
         return np.zeros(length, dtype=float)
 
@@ -199,7 +207,7 @@ def _extract_motor(fieldnames: list[str], data: dict[str, np.ndarray], length: i
     indexed_columns: dict[int, str] = {}
     for name in fieldnames:
         match = motor_pattern.match(name.strip())
-        if match:
+        if match and name in data:  # skip if this column dropped as non-numeric
             indexed_columns[int(match.group(1))] = name
 
     if not indexed_columns:
@@ -296,13 +304,25 @@ def load_blackbox_csv(csv_path: str) -> BlackboxLog:
             f"first offending row index: {malformed[0]}"
         )
 
-    try:
-        values = np.array(data_rows, dtype=float)
-    except ValueError as exc:
-        raise ValueError(f"Blackbox CSV {path} contains non-numeric data: {exc}") from exc
-
-    length = values.shape[0]
-    data = {name: values[:, idx] for idx, name in enumerate(fieldnames)}
+    # Real blackbox_decode output includes non-numeric text columns for flag
+    # fields under its default --unit-flags mode -- e.g. `flightModeFlags
+    # (flags)` renders as "ANGLE_MODE" and `failsafePhase (flags)` as "IDLE",
+    # not numbers. (Discovered against a real downloaded sample .bbl log;
+    # our original synthetic test fixture happened not to include any flag
+    # columns, which is why this wasn't caught earlier.) None of the fields
+    # this loader actually extracts (time, axis P/I/D/F, gyro/setpoint,
+    # throttle, motor, vbat) are ever flag-encoded text in real Betaflight
+    # logs, so it's safe to parse column-by-column and simply drop any
+    # column that isn't numeric, rather than requiring the whole CSV to be
+    # numeric up front.
+    length = len(data_rows)
+    columns_by_index = list(zip(*data_rows))  # transpose: column-major tuples of strings
+    data: dict[str, np.ndarray] = {}
+    for idx, name in enumerate(fieldnames):
+        try:
+            data[name] = np.array(columns_by_index[idx], dtype=float)
+        except ValueError:
+            continue  # non-numeric (e.g. a flags column) -- not needed by this loader
 
     # --- time ---
     time_column = None
@@ -319,6 +339,8 @@ def load_blackbox_csv(csv_path: str) -> BlackboxLog:
             f"Blackbox CSV {path} has no recognizable time column; "
             f"columns found: {fieldnames}"
         )
+    if time_column not in data:
+        raise ValueError(f"Blackbox CSV {path}'s time column {time_column!r} is not numeric")
 
     scale = _TIME_UNIT_SCALE.get(time_unit)
     if scale is None:
@@ -347,7 +369,7 @@ def load_blackbox_csv(csv_path: str) -> BlackboxLog:
     throttle_pct = _compute_throttle_pct(fieldnames, data, length)
     motor = _extract_motor(fieldnames, data, length)
 
-    vbat_column = _find_column(fieldnames, "vbatLatest") or _find_column(fieldnames, "vbat")
+    vbat_column = _find_column(fieldnames, "vbatLatest", data=data) or _find_column(fieldnames, "vbat", data=data)
     vbat_v = data[vbat_column] if vbat_column is not None else None
 
     # --- best-effort header/firmware parsing (see module docstring) ---

@@ -161,6 +161,17 @@ def _autodetect_ports() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# Every analysis module (step_response's 20-500 SP-amplitude gate, the D-term
+# noise thresholds, etc.) assumes gyro/setpoint are in deg/s and vbat is in
+# volts -- blackbox_decode's own defaults are "raw" firmware units for
+# rotation/acceleration, which are NOT deg/s/g and would silently break every
+# unit-dependent threshold in the analysis layer without ever raising an
+# error. This was caught by testing against a real downloaded .bbl log
+# (see docs/research -- always request explicit units at decode time, never
+# rely on blackbox_decode's raw default.
+_DECODE_UNIT_ARGS = ["--unit-rotation", "deg/s", "--unit-acceleration", "g", "--unit-vbat", "V"]
+
+
 @router.post("/logs/upload")
 def upload_log(file: UploadFile = File(...)):
     log_id = uuid.uuid4().hex[:12]
@@ -170,7 +181,7 @@ def upload_log(file: UploadFile = File(...)):
 
     output_dir = config.DECODE_OUTPUT_DIR / log_id
     try:
-        csv_paths = decode_log(str(dest), output_dir=str(output_dir))
+        csv_paths = decode_log(str(dest), output_dir=str(output_dir), extra_args=_DECODE_UNIT_ARGS)
     except (FileNotFoundError, RuntimeError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
