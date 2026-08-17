@@ -114,7 +114,7 @@ class SerialTransport:
         except _PySerialException as exc:
             raise SerialTransportError(f"Error reading from serial port {self.port!r}: {exc}") from exc
         finally:
-            ser.timeout = original_timeout
+            self._restore_timeout(ser, original_timeout)
 
     def readline(self, timeout: Optional[float] = None) -> bytes:
         ser = self._require_open()
@@ -126,7 +126,25 @@ class SerialTransport:
         except _PySerialException as exc:
             raise SerialTransportError(f"Error reading a line from serial port {self.port!r}: {exc}") from exc
         finally:
+            self._restore_timeout(ser, original_timeout)
+
+    @staticmethod
+    def _restore_timeout(ser: "_pyserial.Serial", original_timeout: Optional[float]) -> None:
+        """Best-effort restore of the read timeout after a temporary override.
+
+        Confirmed against a real Betaflight FC: the FC's USB CDC-ACM
+        interface can drop/reset mid-session (e.g. it commonly reboots on
+        CLI `exit`), which makes `ser.timeout = ...` raise
+        (pyserial re-applies termios settings on every timeout write, which
+        fails with "Input/output error" once the underlying device is gone).
+        That must not mask a read that already succeeded, and must not leak
+        a raw pyserial exception out of this "restore" step -- there's
+        nothing more to do here if the port is already dead.
+        """
+        try:
             ser.timeout = original_timeout
+        except _PySerialException:
+            pass
 
     @property
     def is_open(self) -> bool:

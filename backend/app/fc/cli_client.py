@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-from .serial_transport import SerialTransport
+from .serial_transport import SerialTransport, SerialTransportError
 from .version import BetaflightVersion, parse_version_from_cli_banner
 
 # CLI prompt Betaflight prints after most commands / on entering CLI mode.
@@ -55,9 +55,20 @@ class BetaflightCliClient:
     def exit_cli(self) -> None:
         """Leave CLI mode. Betaflight's `exit` command returns to the normal
         MSP-serving state (rebooting if there were unsaved staged changes
-        that require it, otherwise just closing the CLI)."""
-        self.transport.write(b"exit\n")
-        self._read_until_quiet(timeout=1.0)
+        that require it, otherwise just closing the CLI).
+
+        Confirmed against a real Betaflight FC (STM32F411): the FC's USB
+        CDC-ACM connection can drop/reset as a direct result of `exit`, so
+        this is inherently best-effort -- a transport failure here does not
+        mean anything went wrong, and must not be allowed to mask a result
+        (e.g. a version already fetched by get_version()) that a caller
+        obtained before calling exit_cli() as cleanup.
+        """
+        try:
+            self.transport.write(b"exit\n")
+            self._read_until_quiet(timeout=1.0)
+        except SerialTransportError:
+            pass
 
     def _read_until_quiet(self, timeout: float = 3.0, quiet_period: float = 0.2) -> str:
         """Read from the transport until no new bytes arrive for

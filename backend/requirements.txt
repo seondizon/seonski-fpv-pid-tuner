@@ -1,5 +1,10 @@
 fastapi>=0.110
-uvicorn[standard]>=0.29
+# Plain uvicorn, not uvicorn[standard]: the [standard] extra pulls in uvloop,
+# a C/Cython extension with no prebuilt wheel for armv7l -- on a Raspberry Pi
+# 2B it compiles from source and takes several minutes for no functional
+# benefit this app needs (confirmed during Pi deployment). Plain uvicorn uses
+# the standard asyncio loop and needs no compilation.
+uvicorn>=0.29
 numpy>=1.26
 scipy>=1.11
 pyserial>=3.5

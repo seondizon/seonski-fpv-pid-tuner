@@ -25,6 +25,7 @@ from app.fc.version import (
     parse_version_from_cli_banner,
 )
 from app.fc.cli_client import BetaflightCliClient
+from app.fc.serial_transport import SerialTransport, SerialTransportError
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +316,78 @@ def test_get_version_uses_cli_banner_parsing():
     assert version is not None
     assert version.raw == "4.5.0"
     assert version.scheme == "semver"
+
+
+def test_exit_cli_swallows_transport_error():
+    """Regression test: found against a real Betaflight FC (STM32F411) --
+    its USB CDC-ACM connection can drop/reset as a direct result of the
+    `exit` command, which must not be treated as a failure. Confirmed live:
+    a successful get_version() was followed by a 500 because exit_cli()'s
+    cleanup raised an uncaught serial exception."""
+
+    class RaisingOnExitTransport(FakeSerialTransport):
+        def write(self, data: bytes) -> None:
+            if data.decode("utf-8").rstrip("\n") == "exit":
+                raise SerialTransportError("Could not configure port: (5, 'Input/output error')")
+            super().write(data)
+
+    client = BetaflightCliClient(RaisingOnExitTransport())
+    client.exit_cli()  # must not raise
+
+
+class _FakeSerial:
+    """Minimal stand-in for pyserial's Serial, used only to test
+    SerialTransport's own timeout-save/restore behavior (distinct from
+    FakeSerialTransport above, which stands in for the whole SerialTransport
+    at the cli_client level)."""
+
+    def __init__(self):
+        self.is_open = True
+        self._timeout = 2.0
+        self._timeout_set_count = 0
+        self.fail_on_nth_timeout_set: int | None = None
+
+    @property
+    def timeout(self):
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value):
+        self._timeout_set_count += 1
+        if self._timeout_set_count == self.fail_on_nth_timeout_set:
+            import serial
+
+            raise serial.SerialException("Could not configure port: (5, 'Input/output error')")
+        self._timeout = value
+
+    def read(self, size):
+        return b"ok"
+
+    def write(self, data):
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.is_open = False
+
+
+def test_serial_transport_read_survives_timeout_restore_failure(monkeypatch):
+    """Regression test for the same real-hardware finding as
+    test_exit_cli_swallows_transport_error, at the level it actually
+    occurs: SerialTransport.read()'s `finally` block restores the original
+    timeout, and pyserial re-applies termios settings on every timeout
+    write -- which raises once the underlying device has disappeared. A
+    read that already succeeded must not be masked by that restore step."""
+    from app.fc import serial_transport as st
+
+    fake = _FakeSerial()
+    fake.fail_on_nth_timeout_set = 2  # 1st set = override, 2nd = restore (the one that fails)
+    monkeypatch.setattr(st, "_pyserial", type("M", (), {"Serial": lambda **kw: fake}))
+
+    transport = SerialTransport("/dev/fake")
+    transport.open()
+
+    result = transport.read(4096, timeout=0.2)  # must not raise despite the restore failing
+    assert result == b"ok"

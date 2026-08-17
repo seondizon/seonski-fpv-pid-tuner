@@ -35,6 +35,7 @@ from app.analysis.fft_noise import compute_throttle_noise_heatmap, detect_noise_
 from app.analysis.tracking import compute_tracking_error_stats
 from app.fc.serial_transport import SerialTransport, SerialTransportError
 from app.fc.cli_client import BetaflightCliClient
+from app.fc.version import parse_version_from_cli_banner
 
 router = APIRouter()
 
@@ -122,8 +123,17 @@ def connect_fc(body: ConnectRequest = ConnectRequest()):
         client = BetaflightCliClient(transport)
         client.enter_cli()
         try:
-            version = client.get_version()
-            banner = client.run_command("version") if version is None else None
+            # Run `version` once and parse it ourselves (rather than
+            # client.get_version(), which parses internally but doesn't
+            # expose the raw banner) -- we need the raw text either way to
+            # extract the target board, not just the version number.
+            # BUG FOUND against a real FC: the previous version of this code
+            # only re-ran `version` to get a banner when parsing had already
+            # failed, so `target` came out null on every successful connect
+            # (confirmed live: a real Betaflight 4.5.1 FC connected fine but
+            # reported target: null).
+            banner = client.run_command("version")
+            version = parse_version_from_cli_banner(banner)
         finally:
             client.exit_cli()
     except SerialTransportError as exc:
@@ -136,7 +146,7 @@ def connect_fc(body: ConnectRequest = ConnectRequest()):
         _FC_STATE.update({"connected": False, "port": None, "firmware_version": None, "target": None})
         return {"success": False, "message": f"Connected to {port} but could not parse a Betaflight version banner."}
 
-    target_match = _TARGET_PATTERN.search(banner or version.raw)
+    target_match = _TARGET_PATTERN.search(banner)
     _FC_STATE.update(
         {
             "connected": True,
