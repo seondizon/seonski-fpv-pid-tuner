@@ -4,7 +4,7 @@ A Betaflight Blackbox log analyzer and PID tuning assistant, built to run offlin
 
 ## Status
 
-**Deployed and running on the Raspberry Pi 2B** (`rpi2b.local`) as a systemd service (`fpv-tuner.service`), verified reachable at `http://rpi2b.local:8000`. Full test suite passes on-device (real ARMv7/Python 3.13 hardware). Verified a live connection to a real Betaflight FC (4.5.1) over USB serial/CLI. Kiosk-mode display is blocked on a driver decision — see [Deploying to the Pi](#deploying-to-the-pi) below. The tuning-recommendation engine itself is not yet built (deliberately — needs validation against a real, sane Blackbox log first). See [Roadmap](#roadmap) below.
+**Deployed and running on the Raspberry Pi 2B** (`rpi2b.local`) as a systemd service (`fpv-tuner.service`), verified reachable at `http://rpi2b.local:8000`. Full test suite passes on-device (real ARMv7/Python 3.13 hardware). Verified a live connection to a real Betaflight FC (4.5.1) over USB serial/CLI. Kiosk mode is working on the physical GPIO touchscreen, confirmed via a real framebuffer screenshot — see [Deploying to the Pi](#deploying-to-the-pi) below. The tuning-recommendation engine itself is not yet built (deliberately — needs validation against a real, sane Blackbox log first). See [Roadmap](#roadmap) below.
 
 ## Architecture
 
@@ -86,9 +86,18 @@ Then set up `fpv-tuner.service` (systemd unit running `uvicorn app.main:app --ho
 
 **Known deviation from `requirements.txt`**: install plain `uvicorn`, not `uvicorn[standard]` — the `[standard]` extra pulls in `uvloop`, which has no prebuilt wheel for armv7l and compiles from source for several minutes on a Pi 2B for no benefit this app needs.
 
-### Kiosk mode — blocked on a driver decision
+### Kiosk mode — working, verified via physical screenshot
 
-The connected display is a GPIO SPI touchscreen (ILI9341 panel via the legacy `fbtft` staging driver, `dtoverlay=fbtft,spi0-0,ili9341,...` in `/boot/firmware/config.txt`), exposed only as `/dev/fb1` — **it has no DRM/KMS connector at all**. This rules out Wayland-based kiosk compositors like `cage`. The standard fallback for this class of panel is **X11 + `xf86-video-fbdev` + a minimal window manager (`openbox`) + Chromium in kiosk mode** (not Wayland/`--ozone-platform=wayland`); all packages are available in the Trixie apt repos but not yet installed. This needs a decision before proceeding, since it's a real (if small) architecture change from the originally planned Wayland/`cage` approach.
+The connected display is a GPIO SPI touchscreen (ILI9341 panel via the legacy `fbtft` staging driver, `dtoverlay=fbtft,spi0-0,ili9341,...` in `/boot/firmware/config.txt`), exposed only as `/dev/fb1` — it has **no DRM/KMS connector at all**, which rules out Wayland-based kiosk compositors like `cage`. Set up instead with **X11 + `xf86-video-fbdev` + `openbox` + Chromium in kiosk mode**:
+
+- `sudo apt-get install -y xserver-xorg-video-fbdev xinit openbox chromium x11-xserver-utils unclutter fbcat`
+- `/etc/X11/xorg.conf.d/99-fbdev.conf` binds Xorg explicitly to `/dev/fb1` (not the default `/dev/fb0`, which doesn't exist on this board)
+- `/home/seondizon/kiosk.sh` disables screen blanking/DPMS, hides the cursor (`unclutter`), starts `openbox-session`, and launches `chromium --kiosk ... http://localhost:8000` at 320×240
+- Console autologin enabled on tty1 for `seondizon`; `~/.bash_profile` detects a tty1 login with no `$DISPLAY` and runs `exec startx /home/seondizon/kiosk.sh -- -nocursor` — the standard, well-trodden Pi kiosk autostart pattern (a systemd service running X directly fights PAM/VT allocation in ways this avoids)
+
+Verified end-to-end through a full reboot (not just a manual `startx`): Xorg log confirms a clean bind to `/dev/fb1` at 320×240, and a `fbcat /dev/fb1` framebuffer capture — i.e. an actual screenshot of the physical panel, not a guess — shows the real dashboard rendering correctly.
+
+**Known issue**: nav icons render as empty boxes, likely a missing icon font/glyph in this minimal Chromium setup — cosmetic, not functional. **Not yet verified**: touch accuracy/calibration (`ADS7846` touch controller is detected at the kernel level, but confirming it's usable and correctly calibrated needs a human physically tapping the screen — if the touch position feels off, install `xinput-calibrator` and run its calibration wizard).
 
 ### FC hardware note
 
@@ -108,7 +117,8 @@ Per explicit project requirement (see [`docs/research/tuning-algorithms.md`](doc
 - [x] Validate `blackbox_decode` build and CSV parsing against a real Betaflight `.BBL` log (found and fixed 2 real parsing/unit bugs)
 - [x] Deploy to Raspberry Pi 2B hardware: builds, runs, systemd service, full test suite passing on real ARMv7/Python 3.13
 - [x] Validate FC serial/CLI connection against a real Betaflight FC (found and fixed 2 real bugs around USB CDC-ACM reconnect behavior)
-- [ ] Resolve kiosk-mode display approach (X11+fbdev+openbox+chromium, given the connected panel has no DRM/KMS support) and verify visually on the actual touchscreen
+- [x] Resolve kiosk-mode display approach (X11+fbdev+openbox+chromium, given the connected panel has no DRM/KMS support) and verify visually on the actual touchscreen (confirmed via a real framebuffer screenshot)
+- [ ] Verify touch input calibration on the physical screen (needs a human physically tapping it) and fix the missing nav icon glyphs
 - [ ] Validate analysis output (step response, noise, tracking) against PIDtoolbox/PID-Analyzer/SmartTune CLI on a real log with *sane* flight data (the one real log tested so far had implausible sensor values — see git history) — see the validation workflow in `docs/research/reference-analysis.md`
 - [ ] Build the tuning-recommendation engine (deliberately not started yet — needs the above validation first)
 - [ ] Charting (step-response curves, FFT heatmap) in the frontend — currently placeholder boxes; see `backend/static/README.md` for the recommended lightweight charting approach
