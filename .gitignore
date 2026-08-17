@@ -1,0 +1,21 @@
+.claude/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# Built/cloned third-party tools (GPL-3.0 blackbox_decode) — never vendored into the repo
+vendor/
+
+# Blackbox logs and generated analysis artifacts
+*.bbl
+*.bfl
+*.BBL
+*.BFL
+*.csv
+!backend/tests/fixtures/*.csv
+logs/

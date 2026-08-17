@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>FPV Tuner</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="app-header">
+    <h1>FPV Tuner</h1>
+    <span id="fc-pill" class="unknown" aria-live="polite">
+      <span class="dot"></span>
+      <span id="fc-pill-text">Checking...</span>
+    </span>
+  </header>
+
+  <main id="view-container">
+
+    <!-- ============================================================ -->
+    <!-- 1. DASHBOARD / HOME                                           -->
+    <!-- ============================================================ -->
+    <section id="view-dashboard" class="view">
+      <h2>Dashboard</h2>
+      <p class="view-intro">Flight controller status and quick actions.</p>
+
+      <div class="card">
+        <h3>Flight Controller</h3>
+        <div id="fc-status-body">
+          <p class="muted">Loading status...</p>
+        </div>
+        <button id="btn-connect" class="btn btn-primary btn-block btn-lg" style="margin-top:12px;">
+          Connect
+        </button>
+        <p id="connect-feedback" class="muted" style="margin-top:8px;" aria-live="polite"></p>
+      </div>
+
+      <div class="card">
+        <h3>Blackbox Log</h3>
+        <p class="muted mt-0">Upload a log from a USB stick or SD card to start an analysis.</p>
+        <button class="btn btn-block btn-lg" data-nav="upload">
+          Upload / Select Log
+        </button>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- 2. LOG UPLOAD / SELECT                                        -->
+    <!-- ============================================================ -->
+    <section id="view-upload" class="view">
+      <h2>Blackbox Logs</h2>
+      <p class="view-intro">Select a log file to upload and decode.</p>
+
+      <div class="upload-drop">
+        <input type="file" id="log-file-input" accept=".bbl,.bfl,.txt,.log,.csv">
+        <button id="btn-upload" class="btn btn-primary btn-block btn-lg">
+          Upload Log
+        </button>
+        <div class="progress-track" id="upload-progress-track" style="display:none;">
+          <div class="progress-fill" id="upload-progress-fill"></div>
+        </div>
+        <p id="upload-status" class="muted" aria-live="polite">No file selected.</p>
+      </div>
+
+      <div class="card">
+        <h3>Decoded Sessions</h3>
+        <div id="sessions-list">
+          <div class="state-box">
+            <span class="state-icon">&#128193;</span>
+            No sessions yet. Upload a log above to see decoded flight sessions here.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- 3. ANALYSIS VIEW                                              -->
+    <!-- ============================================================ -->
+    <section id="view-analysis" class="view">
+      <h2>Analysis</h2>
+
+      <div id="analysis-no-session" class="state-box">
+        <span class="state-icon">&#128202;</span>
+        No session selected yet.<br>
+        <button class="btn" data-nav="upload" style="margin-top:12px;">Go to Logs</button>
+      </div>
+
+      <div id="analysis-body" style="display:none;">
+        <p class="view-intro" id="analysis-session-label">Session: -</p>
+
+        <div class="segmented" id="axis-toggle" role="group" aria-label="Axis selector">
+          <button data-axis="roll" class="active">Roll</button>
+          <button data-axis="pitch">Pitch</button>
+          <button data-axis="yaw">Yaw</button>
+        </div>
+
+        <div class="tabbar" id="analysis-tabbar" role="tablist">
+          <button data-tab="step" class="active">Step Response</button>
+          <button data-tab="noise">Noise / FFT</button>
+          <button data-tab="tracking">Tracking</button>
+        </div>
+
+        <!-- Step Response tab -->
+        <div class="analysis-tab" data-tab-panel="step">
+          <div id="step-content">
+            <p class="muted">Loading...</p>
+          </div>
+          <div class="chart-placeholder">
+            Step response chart renders here<br>
+            <span class="muted">(roll/pitch/yaw setpoint vs. gyro response curve)</span>
+          </div>
+        </div>
+
+        <!-- Noise / FFT tab -->
+        <div class="analysis-tab" data-tab-panel="noise" style="display:none;">
+          <div id="noise-content">
+            <p class="muted">Loading...</p>
+          </div>
+          <div class="chart-placeholder">
+            Noise / FFT heatmap renders here<br>
+            <span class="muted">(gyro frequency spectrum over the flight)</span>
+          </div>
+        </div>
+
+        <!-- Tracking tab -->
+        <div class="analysis-tab" data-tab-panel="tracking" style="display:none;">
+          <div id="tracking-content">
+            <p class="muted">Loading...</p>
+          </div>
+          <div class="chart-placeholder">
+            Tracking error chart renders here<br>
+            <span class="muted">(setpoint tracking error across the stick range)</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- 4. TUNING RECOMMENDATIONS VIEW                                -->
+    <!-- ============================================================ -->
+    <section id="view-tuning" class="view">
+      <h2>Tuning Recommendations</h2>
+
+      <div class="banner banner-warning">
+        <span class="banner-icon">&#9888;&#65039;</span>
+        <div>
+          <strong>Advisory only &mdash; not auto-applied.</strong>
+          These suggestions are generated from log analysis and have NOT been
+          verified by a human or a test flight. Review every value yourself,
+          understand what it changes, and always perform a cautious test
+          flight (props off first if unsure) before trusting a new tune.
+          Automatic tuning tools &mdash; including Betaflight's own official
+          autotune &mdash; have been documented to produce dangerous results,
+          including a zeroed PID gain in flight.
+        </div>
+      </div>
+
+      <div id="tuning-body">
+        <div class="state-box">
+          <span class="state-icon">&#128203;</span>
+          Loading recommendations...
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <nav id="bottom-nav">
+    <button class="nav-btn active" data-nav="dashboard">
+      <span class="icon">&#127968;</span>
+      <span>Dashboard</span>
+    </button>
+    <button class="nav-btn" data-nav="upload">
+      <span class="icon">&#128193;</span>
+      <span>Logs</span>
+    </button>
+    <button class="nav-btn" data-nav="analysis">
+      <span class="icon">&#128202;</span>
+      <span>Analysis</span>
+    </button>
+    <button class="nav-btn" data-nav="tuning">
+      <span class="icon">&#128295;</span>
+      <span>Tuning</span>
+    </button>
+  </nav>
+
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

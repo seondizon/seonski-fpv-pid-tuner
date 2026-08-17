@@ -1,0 +1,547 @@
+/* ==========================================================================
+   FPV Tuner - styles.css
+   Touch-first, dependency-free CSS for a Raspberry Pi 2B kiosk display.
+   Target viewports: 800x480 / 1024x600 landscape touchscreens.
+
+   Theme strategy: single dark-leaning default palette (defined on :root),
+   with a light override under prefers-color-scheme: light. No JS theme
+   switcher - simplest thing that satisfies "works in a dark garage or a
+   bright field" per the design brief.
+   ========================================================================== */
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  /* Dark theme (default) */
+  --bg: #12151a;
+  --bg-elevated: #1b2129;
+  --bg-elevated-2: #232a34;
+  --text: #eef1f5;
+  --text-dim: #a7b0bd;
+  --border: #2d3540;
+  --accent: #4cc2ff;
+  --accent-text: #06202c;
+  --danger: #ff6b6b;
+  --danger-bg: #3a1d1d;
+  --warning: #ffb020;
+  --warning-bg: #3a2c0f;
+  --success: #4caf6d;
+  --success-bg: #163524;
+  --tile-bg: var(--bg-elevated);
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  --radius: 10px;
+  --tap-min: 48px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f3f5f8;
+    --bg-elevated: #ffffff;
+    --bg-elevated-2: #eef1f5;
+    --text: #171a1f;
+    --text-dim: #4b5563;
+    --border: #d7dce2;
+    --accent: #0077b6;
+    --accent-text: #ffffff;
+    --danger: #c62828;
+    --danger-bg: #fbdede;
+    --warning: #a15c00;
+    --warning-bg: #fdf0d9;
+    --success: #1e7d42;
+    --success-bg: #e0f3e6;
+    --shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  }
+}
+
+html, body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
+}
+
+button, input, select {
+  font-family: inherit;
+  font-size: 1rem;
+  color: var(--text);
+}
+
+/* Kiosk touch: avoid text-selection / callouts on interactive chrome,
+   but leave body text selectable (e.g. rationale text, values). */
+button, .nav-btn, .segmented button, .tabbar button {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+button {
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ---------- Header ---------- */
+#app-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+
+#app-header h1 {
+  font-size: 1.05rem;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+#fc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+#fc-pill .dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+#fc-pill.connected .dot { background: var(--success); }
+#fc-pill.disconnected .dot { background: var(--danger); }
+#fc-pill.unknown .dot { background: var(--text-dim); }
+
+/* ---------- Main view area ---------- */
+#view-container {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 14px 14px 24px;
+}
+
+.view {
+  display: none;
+}
+
+.view.active {
+  display: block;
+}
+
+.view h2 {
+  margin-top: 0;
+  font-size: 1.2rem;
+}
+
+.view-intro {
+  color: var(--text-dim);
+  margin-top: -6px;
+  margin-bottom: 14px;
+  font-size: 0.92rem;
+}
+
+/* ---------- Cards / panels ---------- */
+.card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 14px;
+  box-shadow: var(--shadow);
+}
+
+.card h3 {
+  margin-top: 0;
+  margin-bottom: 10px;
+  font-size: 1rem;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px dashed var(--border);
+}
+
+.row:last-child { border-bottom: none; }
+
+.row .label { color: var(--text-dim); }
+.row .value { font-weight: 600; text-align: right; }
+
+/* ---------- Buttons ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  padding: 12px 20px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.btn:active {
+  transform: scale(0.98);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: transparent;
+}
+
+.btn-block {
+  width: 100%;
+}
+
+.btn-lg {
+  min-height: 64px;
+  font-size: 1.1rem;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-danger-outline {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+}
+
+/* ---------- Bottom nav ---------- */
+#bottom-nav {
+  flex: 0 0 auto;
+  display: flex;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.nav-btn {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-height: 60px;
+  padding: 6px 4px;
+  background: none;
+  border: none;
+  border-top: 3px solid transparent;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.nav-btn .icon {
+  font-size: 1.25rem;
+  line-height: 1;
+}
+
+.nav-btn.active {
+  color: var(--accent);
+  border-top-color: var(--accent);
+}
+
+/* ---------- Segmented control (axis toggle) ---------- */
+.segmented {
+  display: flex;
+  gap: 6px;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px;
+  margin-bottom: 14px;
+}
+
+.segmented button {
+  flex: 1 1 0;
+  min-height: 44px;
+  border: none;
+  border-radius: calc(var(--radius) - 4px);
+  background: transparent;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.segmented button.active {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+/* ---------- Tab bar (analysis sections) ---------- */
+.tabbar {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.tabbar button {
+  flex: 1 1 auto;
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.tabbar button.active {
+  background: var(--bg-elevated-2);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ---------- Stat tiles ---------- */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.stat-tile {
+  background: var(--tile-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  text-align: center;
+}
+
+.stat-tile .stat-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  display: block;
+}
+
+.stat-tile .stat-label {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  display: block;
+  margin-top: 4px;
+}
+
+/* ---------- Chart placeholder ---------- */
+.chart-placeholder {
+  min-height: 180px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--text-dim);
+  background: var(--bg-elevated-2);
+  padding: 16px;
+  margin-bottom: 14px;
+  font-size: 0.9rem;
+}
+
+/* ---------- Empty / error / loading states ---------- */
+.state-box {
+  padding: 22px 16px;
+  text-align: center;
+  color: var(--text-dim);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  margin-bottom: 14px;
+}
+
+.state-box .state-icon {
+  font-size: 1.8rem;
+  display: block;
+  margin-bottom: 8px;
+}
+
+/* ---------- Banner (warning) ---------- */
+.banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  margin-bottom: 14px;
+  font-size: 0.92rem;
+}
+
+.banner-warning {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning);
+  color: var(--text);
+}
+
+.banner strong {
+  color: var(--warning);
+}
+
+.banner-icon {
+  font-size: 1.3rem;
+  flex: 0 0 auto;
+}
+
+/* ---------- Recommendation cards ---------- */
+.rec-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  margin-bottom: 12px;
+  box-shadow: var(--shadow);
+}
+
+.rec-card.demo {
+  opacity: 0.85;
+  border-style: dashed;
+}
+
+.rec-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.rec-card-head h4 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.badge-demo {
+  background: var(--bg-elevated-2);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+
+.confidence-high { background: var(--success-bg); color: var(--success); }
+.confidence-medium { background: var(--warning-bg); color: var(--warning); }
+.confidence-low { background: var(--danger-bg); color: var(--danger); }
+
+.rec-values {
+  display: flex;
+  gap: 18px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.rec-values div span {
+  display: block;
+}
+
+.rec-values .v-label {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.rec-values .v-value {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.rec-rationale {
+  color: var(--text-dim);
+  font-size: 0.88rem;
+  margin-bottom: 10px;
+}
+
+/* ---------- Upload ---------- */
+.upload-drop {
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 24px 16px;
+  text-align: center;
+  background: var(--bg-elevated);
+  margin-bottom: 14px;
+}
+
+input[type="file"] {
+  display: block;
+  width: 100%;
+  padding: 10px;
+  margin: 10px 0;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  min-height: var(--tap-min);
+}
+
+.session-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-item:last-child { border-bottom: none; }
+
+.progress-track {
+  width: 100%;
+  height: 10px;
+  background: var(--bg-elevated-2);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: 10px 0;
+  border: 1px solid var(--border);
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.muted {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.mt-0 { margin-top: 0; }
+.mb-0 { margin-bottom: 0; }
