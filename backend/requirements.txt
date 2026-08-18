@@ -1,16 +1,8 @@
-fastapi>=0.110
-# Plain uvicorn, not uvicorn[standard]: the [standard] extra pulls in uvloop,
-# a C/Cython extension with no prebuilt wheel for armv7l -- on a Raspberry Pi
-# 2B it compiles from source and takes several minutes for no functional
-# benefit this app needs (confirmed during Pi deployment). Plain uvicorn uses
-# the standard asyncio loop and needs no compilation.
-uvicorn>=0.29
+# This is a reference-implementation + cross-validation toolkit now, not a
+# deployed server -- see the top-level README. Only what app/blackbox,
+# app/analysis, app/fc, and app/tuning actually import, plus pytest.
 numpy>=1.26
 scipy>=1.11
 pyserial>=3.5
-pydantic>=2.6
-python-multipart>=0.0.9
 
-# Dev/test only
 pytest>=8.0
-httpx>=0.27
