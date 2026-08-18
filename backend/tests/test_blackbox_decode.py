@@ -114,6 +114,37 @@ def test_decode_log_raises_on_nonzero_exit(monkeypatch, tmp_path):
     assert "some stdout" in message
 
 
+def test_decode_log_raises_on_timeout_instead_of_hanging(monkeypatch, tmp_path):
+    """Regression test: found live against a real FC whose flash reported
+    100% used (i.e. likely never erased) -- blackbox_decode went into a
+    genuine infinite loop (confirmed via `ps` showing 25+ minutes of
+    sustained 99.9% CPU, zero output), matching the known blackbox-tools
+    issue #74 hang risk this project flagged in its own research before
+    ever hitting it. decode_log must bound the subprocess with a timeout
+    and raise a clear, actionable RuntimeError rather than hanging forever."""
+    import subprocess
+
+    log_file = tmp_path / "LOG0001.BBL"
+    log_file.write_bytes(b"not a real log")
+
+    monkeypatch.setattr(
+        decode_module, "find_blackbox_decode_binary", lambda: "/usr/bin/blackbox_decode"
+    )
+
+    def fake_run(*args, **kwargs):
+        assert "timeout" in kwargs and kwargs["timeout"] is not None
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"], output="partial out", stderr="partial err")
+
+    monkeypatch.setattr(decode_module.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        decode_module.decode_log(str(log_file), timeout=5)
+
+    message = str(exc_info.value)
+    assert "did not finish within 5s" in message
+    assert "erase" in message.lower()  # actionable guidance, not just "it timed out"
+
+
 def test_decode_log_raises_when_no_csv_produced(monkeypatch, tmp_path):
     """Even a zero-exit-code run must be treated as a failure if no CSV
     output can be found -- we should not return an empty list silently."""

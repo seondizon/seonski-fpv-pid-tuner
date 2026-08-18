@@ -66,9 +66,18 @@ def build_msp_v1_request(command: int, payload: bytes = b"") -> bytes:
 
 
 def parse_msp_v1_response(data: bytes) -> tuple[int, bytes]:
-    """Parse an MSP v1 response frame from the FC.
+    """Parse an MSP v1 response frame from the FC, including the "jumbo
+    frame" extension used for payloads too large for the 1-byte size field
+    (confirmed via a real Betaflight FC and corroborating documentation:
+    Betaflight Configurator's dataflash-read path specifically uses jumbo
+    frames, since the plain 255-byte cap makes chunked flash reads
+    impractically slow -- see read_blackbox_from_fc's docstring).
 
-    Layout: '$' 'M' '>' <size:u8> <command:u8> <payload> <checksum:u8>
+    Layout (plain):  '$' 'M' '>' <size:u8, 0-254> <command:u8> <payload> <checksum:u8>
+    Layout (jumbo):  '$' 'M' '>' <0xFF> <command:u8> <size:u16 LE> <payload> <checksum:u8>
+    In the jumbo case the checksum XORs 0xFF, command, both size bytes, and
+    every payload byte (i.e. everything between the direction byte and the
+    checksum byte, same rule as the plain case, just over more bytes).
 
     Returns (command, payload). Raises ValueError on any malformed frame or
     checksum mismatch, with a message describing what was wrong.
@@ -83,23 +92,77 @@ def parse_msp_v1_response(data: bytes) -> tuple[int, bytes]:
     if direction != _DIRECTION_FROM_FC:
         raise ValueError(f"MSP frame has unexpected direction byte {direction!r}, expected '>'")
 
-    size = data[3]
+    size_byte = data[3]
     command = data[4]
-    expected_len = 5 + size + 1  # header fields already consumed (5) + payload + checksum
+
+    if size_byte == 0xFF:
+        if len(data) < 7:
+            raise ValueError("MSP jumbo frame too short to contain its 16-bit size field")
+        size = data[5] | (data[6] << 8)
+        checksum_fields = bytes([size_byte, command, data[5], data[6]])
+        payload_start = 7
+    else:
+        size = size_byte
+        checksum_fields = bytes([size_byte, command])
+        payload_start = 5
+
+    expected_len = payload_start + size + 1  # + checksum byte
     if len(data) < expected_len:
         raise ValueError(
             f"MSP frame truncated: declared payload size {size} requires {expected_len} "
             f"total bytes, got {len(data)}"
         )
-    payload = data[5 : 5 + size]
-    checksum_byte = data[5 + size]
-    expected_checksum = _checksum(size, command, payload)
-    if checksum_byte != expected_checksum:
-        raise ValueError(
-            f"MSP checksum mismatch for command {command}: expected {expected_checksum:#04x}, "
-            f"got {checksum_byte:#04x}"
-        )
+    payload = data[payload_start : payload_start + size]
+    checksum_byte = data[payload_start + size]
+
+    chk = 0
+    for b in checksum_fields:
+        chk ^= b
+    for b in payload:
+        chk ^= b
+    if checksum_byte != (chk & 0xFF):
+        raise ValueError(f"MSP checksum mismatch for command {command}: expected {chk & 0xFF:#04x}, got {checksum_byte:#04x}")
     return command, payload
+
+
+def read_msp_v1_frame(transport, timeout: float = 3.0) -> bytes:
+    """Incrementally read exactly one MSP v1 (or jumbo) frame from
+    `transport` (anything with a `.read(n, timeout=...)` method, e.g.
+    SerialTransport).
+
+    BUG FOUND against a real FC: pyserial's `Serial.read(n)` blocks until
+    either `n` bytes arrive or its timeout elapses -- it does NOT return
+    early just because a complete, smaller frame has already arrived.
+    Requesting an oversized buffer (e.g. 4096 bytes, as earlier code in
+    this module's callers did) for a response that's only ~20-140 bytes
+    therefore stalls for the FULL timeout on every single call. Confirmed
+    live: every MSP round-trip was taking a flat 3.0s (exactly the
+    configured timeout) instead of the sub-100ms the hardware actually
+    needed -- which made a multi-megabyte Blackbox download look "stuck"
+    (at that rate it would have taken hours). This function reads exactly
+    the number of bytes the MSP framing declares at each stage, so each
+    underlying read call completes as soon as its expected bytes actually
+    arrive, rather than idling for bytes that were never coming.
+    """
+    header = transport.read(3, timeout=timeout)
+    if len(header) < 3:
+        raise ValueError(f"MSP frame header read timed out or was truncated (got {len(header)}/3 bytes)")
+    size_and_command = transport.read(2, timeout=timeout)
+    if len(size_and_command) < 2:
+        raise ValueError("MSP frame size/command read timed out or was truncated")
+    size_byte = size_and_command[0]
+    jumbo_size_bytes = b""
+    if size_byte == 0xFF:
+        jumbo_size_bytes = transport.read(2, timeout=timeout)
+        if len(jumbo_size_bytes) < 2:
+            raise ValueError("MSP jumbo frame size field read timed out or was truncated")
+        real_size = jumbo_size_bytes[0] | (jumbo_size_bytes[1] << 8)
+    else:
+        real_size = size_byte
+    rest = transport.read(real_size + 1, timeout=timeout)  # payload + checksum
+    if len(rest) < real_size + 1:
+        raise ValueError(f"MSP frame payload/checksum read timed out: expected {real_size + 1} bytes, got {len(rest)}")
+    return header + size_and_command + jumbo_size_bytes + rest
 
 
 @dataclass
@@ -161,19 +224,29 @@ class DataflashSummary:
 
 
 def parse_dataflash_summary_payload(payload: bytes) -> DataflashSummary:
-    """Per Betaflight's MSP_DATAFLASH_SUMMARY (src/main/msp/msp.c):
-        flags: 1 byte (bit 0 = ready)
+    """Per Betaflight's MSP_DATAFLASH_SUMMARY reply (confirmed against a
+    real FC and cross-checked against betaflight-configurator's MSPHelper.js
+    parsing, which reads the fields in this exact order -- an earlier
+    version of this function was WRONG about the layout, see below):
+        flags: 1 byte (bit 0 = ready, bit 1 = supported)
+        sectors: uint32 LE   (number of erase sectors -- NOT part of the
+                               original docstring here; its omission shifted
+                               every field after it by 4 bytes)
         totalSize: uint32 LE
         usedSize: uint32 LE
-    Some firmware versions append more fields after this (e.g. sector/page
-    info) -- only the first 9 bytes are parsed; anything beyond that is
-    ignored rather than requiring an exact length match, since only
-    ready/total/used are needed here.
+
+    BUG FOUND against real hardware: this function used to read totalSize
+    and usedSize starting right after the flags byte, silently skipping the
+    `sectors` field that actually comes first. On our real FC (16MB flash,
+    256 erase sectors -- 256 * 65536 = 16777216, consistent with a 64KB
+    sector size) the old code reported total_size_bytes=256 (actually the
+    sector *count*) and used_size_bytes=16777216 (actually the real
+    totalSize) -- nonsensical (used > total) and exactly backwards.
     """
-    if len(payload) < 9:
-        raise ValueError(f"MSP_DATAFLASH_SUMMARY payload too short: expected >= 9 bytes, got {len(payload)}")
+    if len(payload) < 13:
+        raise ValueError(f"MSP_DATAFLASH_SUMMARY payload too short: expected >= 13 bytes, got {len(payload)}")
     flags = payload[0]
-    total_size, used_size = struct.unpack_from("<II", payload, 1)
+    _sectors, total_size, used_size = struct.unpack_from("<III", payload, 1)
     return DataflashSummary(ready=bool(flags & 0x01), total_size_bytes=total_size, used_size_bytes=used_size)
 
 

@@ -25,6 +25,7 @@ from app.fc.msp import (
     build_dataflash_read_request,
     parse_dataflash_summary_payload,
     parse_dataflash_read_payload,
+    read_msp_v1_frame,
 )
 from app.fc.version import (
     BetaflightVersion,
@@ -42,12 +43,21 @@ from app.fc.serial_transport import SerialTransport, SerialTransportError
 
 def _build_response_frame(command: int, payload: bytes) -> bytes:
     """Manually construct a plausible MSP v1 response frame with a correct
-    checksum, mirroring what a real FC would send back."""
+    checksum, mirroring what a real FC would send back. Builds a jumbo frame
+    (per msp.py's parse_msp_v1_response) when payload exceeds the 254-byte
+    plain limit -- real FCs use jumbo frames for large dataflash-read
+    chunks, so tests exercising those need this builder to support it too."""
     size = len(payload)
-    checksum = size ^ command
+    if size <= 254:
+        checksum = size ^ command
+        for b in payload:
+            checksum ^= b
+        return b"$M>" + bytes([size, command]) + payload + bytes([checksum & 0xFF])
+    size_lo, size_hi = size & 0xFF, (size >> 8) & 0xFF
+    checksum = 0xFF ^ command ^ size_lo ^ size_hi
     for b in payload:
         checksum ^= b
-    return b"$M>" + bytes([size, command]) + payload + bytes([checksum & 0xFF])
+    return b"$M>" + bytes([0xFF, command, size_lo, size_hi]) + payload + bytes([checksum & 0xFF])
 
 
 def test_msp_v1_request_frame_structure():
@@ -408,15 +418,33 @@ def test_serial_transport_read_survives_timeout_restore_failure(monkeypatch):
 def test_dataflash_summary_payload_parses_ready_with_sizes():
     import struct
 
-    payload = bytes([0x01]) + struct.pack("<II", 2 * 1024 * 1024, 123456)
+    # flags, sectors, totalSize, usedSize -- confirmed field order against a
+    # real FC and betaflight-configurator's MSPHelper.js parsing. An earlier
+    # version of this test (and the parser) omitted the `sectors` field,
+    # which shifted totalSize/usedSize by 4 bytes and silently swapped their
+    # apparent meaning.
+    payload = bytes([0x01]) + struct.pack("<III", 32, 2 * 1024 * 1024, 123456)
     summary = parse_dataflash_summary_payload(payload)
     assert summary == DataflashSummary(ready=True, total_size_bytes=2 * 1024 * 1024, used_size_bytes=123456)
+
+
+def test_dataflash_summary_payload_matches_real_hardware_capture():
+    """Regression test: exact bytes captured from a real FC (16MB SPI flash,
+    256 sectors -- 256 * 65536 = 16777216, consistent with a 64KB sector
+    size). The pre-fix parser reported total_size_bytes=256 (actually the
+    sector count) and used_size_bytes=16777216 (actually totalSize) --
+    nonsensical, since used > total."""
+    payload = bytes([0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01])
+    summary = parse_dataflash_summary_payload(payload)
+    assert summary.ready is True
+    assert summary.total_size_bytes == 16 * 1024 * 1024
+    assert summary.used_size_bytes == 16 * 1024 * 1024
 
 
 def test_dataflash_summary_payload_not_ready():
     import struct
 
-    payload = bytes([0x00]) + struct.pack("<II", 2 * 1024 * 1024, 0)
+    payload = bytes([0x00]) + struct.pack("<III", 32, 2 * 1024 * 1024, 0)
     summary = parse_dataflash_summary_payload(payload)
     assert summary.ready is False
     assert summary.used_size_bytes == 0
@@ -425,7 +453,7 @@ def test_dataflash_summary_payload_not_ready():
 def test_dataflash_summary_payload_tolerates_extra_trailing_bytes():
     import struct
 
-    payload = bytes([0x01]) + struct.pack("<II", 100, 50) + b"\x01\x02\x03"
+    payload = bytes([0x01]) + struct.pack("<III", 4, 100, 50) + b"\x01\x02\x03"
     summary = parse_dataflash_summary_payload(payload)
     assert summary.total_size_bytes == 100
     assert summary.used_size_bytes == 50
@@ -469,3 +497,69 @@ def test_dataflash_read_roundtrip_via_msp_frame():
 def test_dataflash_read_payload_too_short_raises():
     with pytest.raises(ValueError):
         parse_dataflash_read_payload(b"\x01\x02")
+
+
+# ---------------------------------------------------------------------------
+# msp.py -- read_msp_v1_frame (incremental reader)
+# ---------------------------------------------------------------------------
+
+
+class _BufferedFakeTransport:
+    """Serves .read(n, timeout=...) incrementally from a pre-seeded buffer,
+    exactly n bytes at a time (or fewer if short) -- mirrors real pyserial
+    semantics (blocks for up to n bytes, returns early with fewer only on a
+    real timeout/EOF) closely enough to test read_msp_v1_frame's multi-call
+    reading logic without needing real hardware."""
+
+    def __init__(self, data: bytes):
+        self._buffer = data
+        self.read_calls: list[int] = []  # sizes requested, for assertions
+
+    def read(self, size: int, timeout: float | None = None) -> bytes:
+        self.read_calls.append(size)
+        chunk, self._buffer = self._buffer[:size], self._buffer[size:]
+        return chunk
+
+
+def test_read_msp_v1_frame_plain_reads_exact_sizes_not_oversized():
+    """Regression test: this used to be `transport.read(4096, timeout=...)`
+    in callers -- pyserial's Serial.read(n) blocks for the FULL timeout
+    when fewer than n bytes will ever arrive, which made every real MSP
+    round trip stall for the configured timeout (confirmed live: a flat
+    3.0s per call) instead of returning as soon as the actual ~20-byte
+    response showed up. read_msp_v1_frame must never request more bytes
+    than the frame actually declares."""
+    frame = _build_response_frame(MSP_FC_VARIANT, b"BTFL")
+    transport = _BufferedFakeTransport(frame)
+
+    result = read_msp_v1_frame(transport)
+
+    assert result == frame
+    assert transport.read_calls == [3, 2, 5]  # header(3), size+command(2), payload+checksum(4+1)
+    assert max(transport.read_calls) < 4096  # never the old oversized-buffer request
+
+
+def test_read_msp_v1_frame_jumbo_reads_extra_size_field():
+    payload = b"x" * 300  # forces jumbo framing (> 254 bytes)
+    frame = _build_response_frame(MSP_DATAFLASH_READ, payload)
+    transport = _BufferedFakeTransport(frame)
+
+    result = read_msp_v1_frame(transport)
+
+    assert result == frame
+    command, parsed_payload = parse_msp_v1_response(result)
+    assert command == MSP_DATAFLASH_READ
+    assert parsed_payload == payload
+
+
+def test_read_msp_v1_frame_raises_on_truncated_header():
+    transport = _BufferedFakeTransport(b"$M")  # only 2 of 3 header bytes ever arrive
+    with pytest.raises(ValueError, match="header"):
+        read_msp_v1_frame(transport)
+
+
+def test_read_msp_v1_frame_raises_on_truncated_payload():
+    frame = _build_response_frame(MSP_FC_VARIANT, b"BTFL")
+    transport = _BufferedFakeTransport(frame[:-2])  # cut off before payload/checksum fully arrive
+    with pytest.raises(ValueError, match="payload/checksum"):
+        read_msp_v1_frame(transport)

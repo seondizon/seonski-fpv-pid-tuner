@@ -18,6 +18,7 @@ from .msp import (
     parse_dataflash_read_payload,
     parse_dataflash_summary_payload,
     parse_msp_v1_response,
+    read_msp_v1_frame,
 )
 from .serial_transport import SerialTransport
 
@@ -28,6 +29,15 @@ from .serial_transport import SerialTransport
 # path.
 _MAX_READ_ITERATIONS = 500_000
 
+# Requested per-chunk size for MSP_DATAFLASH_READ, via the jumbo-frame
+# extension (confirmed Betaflight Configurator itself uses jumbo frames for
+# this exact command, since the plain MSP v1 255-byte payload cap makes
+# chunked multi-megabyte flash reads impractically slow -- a 16MB log at
+# ~128 bytes/round-trip would need >131,000 round trips). 2048 bytes keeps
+# well under MSP v1's 16-bit jumbo size field limit while cutting the
+# round-trip count by roughly 16x.
+_REQUESTED_CHUNK_SIZE = 2048
+
 
 class BlackboxNotAvailableError(Exception):
     """Raised when the FC's dataflash isn't ready or has no stored log."""
@@ -35,11 +45,16 @@ class BlackboxNotAvailableError(Exception):
 
 def _msp_request_response(transport: SerialTransport, command: int, payload: bytes = b"", timeout: float = 3.0) -> bytes:
     transport.write(build_msp_v1_request(command, payload))
-    # MSP responses aren't newline-terminated like CLI text; read a
-    # generously-sized chunk with the given timeout and rely on
-    # parse_msp_v1_response's own length/checksum validation to tell us
-    # whether we got a complete frame.
-    raw = transport.read(4096, timeout=timeout)
+    # BUG FOUND against real hardware: this used to do
+    # `transport.read(4096, timeout=timeout)` -- pyserial's Serial.read(n)
+    # blocks until either n bytes arrive or the timeout elapses, it does NOT
+    # return early on a complete-but-smaller response. Every MSP round trip
+    # was stalling for the full timeout (confirmed: a flat 3.0s per call)
+    # instead of the sub-100ms the hardware needed. read_msp_v1_frame reads
+    # exactly the number of bytes the framing declares at each stage, so
+    # each read call completes as soon as its expected bytes actually
+    # arrive. See read_msp_v1_frame's docstring for the full story.
+    raw = read_msp_v1_frame(transport, timeout=timeout)
     _, response_payload = parse_msp_v1_response(raw)
     return response_payload
 
@@ -80,7 +95,7 @@ def read_blackbox_from_fc(
                 f"({bytes_read}/{total} bytes read) -- aborting to avoid an infinite loop"
             )
 
-        request_payload = build_dataflash_read_request(bytes_read)
+        request_payload = build_dataflash_read_request(bytes_read, read_length=_REQUESTED_CHUNK_SIZE)
         response_payload = _msp_request_response(transport, MSP_DATAFLASH_READ, request_payload)
         result = parse_dataflash_read_payload(response_payload)
 

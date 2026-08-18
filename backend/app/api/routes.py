@@ -34,7 +34,13 @@ from app.fc.version import parse_version_from_cli_banner
 from app.fc.detect import detect_fc_port
 from app.fc.info import get_blackbox_storage_type, get_craft_name, get_pid_profile_index
 from app.fc.blackbox_reader import BlackboxNotAvailableError, read_blackbox_from_fc
-from app.fc.msp import MSP_DATAFLASH_SUMMARY, build_msp_v1_request, parse_dataflash_summary_payload, parse_msp_v1_response
+from app.fc.msp import (
+    MSP_DATAFLASH_SUMMARY,
+    build_msp_v1_request,
+    parse_dataflash_summary_payload,
+    parse_msp_v1_response,
+    read_msp_v1_frame,
+)
 from app.jobs import create_job, get_job, run_in_background
 from app.tuning.engine import compute_readiness, generate_recommendations
 from app.tuning.stopping import evaluate_tune_complete
@@ -158,7 +164,12 @@ def _query_dataflash_available(transport: SerialTransport) -> Optional[bool]:
     not a false positive/negative."""
     try:
         transport.write(build_msp_v1_request(MSP_DATAFLASH_SUMMARY))
-        raw = transport.read(4096, timeout=2.0)
+        # read_msp_v1_frame, not a raw oversized transport.read(4096, ...):
+        # pyserial's read(n) blocks for the full timeout when fewer than n
+        # bytes will ever arrive, which made this stall for a flat 2s on
+        # every connect (confirmed against real hardware) instead of
+        # returning as soon as the ~20-byte response actually showed up.
+        raw = read_msp_v1_frame(transport, timeout=2.0)
         _, payload = parse_msp_v1_response(raw)
         summary = parse_dataflash_summary_payload(payload)
         return summary.ready and summary.used_size_bytes > 0
