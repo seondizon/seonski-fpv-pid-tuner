@@ -34,6 +34,12 @@
           }
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "deb2a5d6-10a4-4b14-9ead-7d25b9ed89ae"
+      }
+    },
+    "owner": "seondizon"
   }
 }
