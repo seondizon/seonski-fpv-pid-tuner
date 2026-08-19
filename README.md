@@ -131,7 +131,7 @@ The Python backend (`backend/`) is kept in the repo but no longer runs as a depl
 
 ## Status
 
-The mobile app is feature-complete for the core tuning loop above and has been validated live against multiple real, differently-versioned Betaflight flight controllers (STM32F405, STM32F722, and STM32G47X boards across Betaflight 4.4.2 through 4.5.0, plus targeted compatibility fixes for the 4.2–4.3 and 2025.12+ calendar-versioning boundaries). What's still open:
+The mobile app is feature-complete for the core tuning loop above and has been validated live against multiple real, differently-versioned Betaflight flight controllers (STM32F405 on Betaflight 4.4.2, STM32G47X on Betaflight 4.5.0), plus targeted compatibility fixes for the 4.2–4.3 and 2025.12+ calendar-versioning boundaries verified against Betaflight's own source rather than a live board on those exact versions. A third real board (STM32F722) turned out to have a hardware-level fault unrelated to this app — it never sent a single byte back over USB regardless of command — which at least confirmed the connection-failure and disconnect-handling paths behave correctly on a genuinely broken connection, not just the happy path. What's still open:
 
 - Live-hardware testing has covered a handful of real boards/firmware versions within the supported 4.2–latest range, not exhaustive coverage of every combination — treat older (4.2.x) firmware as validated by source research and CLI-compatibility fallbacks, not yet by a live board on that exact version.
 - No Play Store distribution yet (sideloaded debug builds only).
