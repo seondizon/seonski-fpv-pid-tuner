@@ -1,0 +1,30 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.usbserial'
+version = '0.1.0'
+
+android {
+  namespace "expo.modules.usbserial"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+  }
+  lintOptions {
+    abortOnError false
+  }
+}
+
+repositories {
+  // usb-serial-for-android is published via JitPack, not Maven Central.
+  maven { url 'https://jitpack.io' }
+}
+
+dependencies {
+  // The standard library for CDC-ACM (and FTDI/CP210x/CH340/PL2303) USB
+  // serial devices on Android -- this is exactly the device class our FC
+  // presents as (confirmed earlier: STM32 Virtual COM Port, 0483:5740).
+  implementation 'com.github.mik3y:usb-serial-for-android:3.9.0'
+}

@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!--
+    USB host mode is required to talk to the FC. This is a device feature
+    declaration, not a runtime permission: Android's USB host API grants
+    access per device via UsbManager.requestPermission() at runtime instead
+    of a manifest-declared dangerous permission, which is why there's no
+    uses-permission tag for USB here.
+  -->
+  <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+</manifest>

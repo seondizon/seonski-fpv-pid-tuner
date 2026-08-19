@@ -18,6 +18,8 @@ vendor/
 *.BFL
 *.csv
 !backend/tests/fixtures/*.csv
+!mobile/src/blackbox/__tests__/fixtures/*.bbl
+!mobile/src/blackbox/__tests__/fixtures/*.csv
 logs/
 
 # Runtime-generated data (uploaded/decoded logs, persistent tune-iteration
